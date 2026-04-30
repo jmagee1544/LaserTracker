@@ -1,0 +1,220 @@
+/*
+ * Human Tracker - Pan/Tilt Laser System
+ * ======================================
+ *
+ * SAFETY NOTICE:
+ *   Use ONLY a Class 1 or Class 2 laser (<1mW red laser diode module).
+ *   NEVER aim at eyes, faces, or reflective surfaces.
+ *   Always test in a safe, controlled environment.
+ *   This is for educational/hobby purposes only.
+ *
+ * How it works:
+ *   The PIR sensor is mounted ON the pan servo alongside the laser —
+ *   they move together. The system sweeps until the PIR detects human
+ *   heat (IR radiation), then locks the laser at that angle.
+ *   A small tilt oscillation keeps tracking vertically.
+ *   If the target is lost, it holds briefly then resumes sweeping.
+ *
+ * Components:
+ *   - Arduino Uno or Nano
+ *   - 2x SG90 or MG90S servo motors (pan + tilt)
+ *   - 1x HC-SR501 PIR motion sensor
+ *   - 1x Laser diode module (red, <5mW — use the weakest you have)
+ *   - Pan/tilt bracket (3D printed or hobby servo bracket kit)
+ *   - 100Ω resistor (series with laser if no built-in resistor)
+ *   - Small breadboard + jumper wires
+ *
+ * Wiring:
+ *   Pan Servo    Signal → Pin 9   | VCC → 5V | GND → GND
+ *   Tilt Servo   Signal → Pin 10  | VCC → 5V | GND → GND
+ *   PIR Sensor   OUT    → Pin 2   | VCC → 5V | GND → GND
+ *   Laser Module Signal → Pin 3   | VCC → 5V | GND → GND
+ *                (add 100Ω in series if your module has no resistor)
+ *
+ * Mounting:
+ *   1. Tilt servo is the BASE — mounts to your stand, tilts up/down.
+ *   2. Pan servo mounts on the tilt servo arm — rotates left/right.
+ *   3. Laser + PIR mount on the pan servo arm, side by side.
+ *      The PIR should face the same direction as the laser dot.
+ *   4. Point the whole assembly at roughly human chest height.
+ *
+ * Tuning:
+ *   - TILT_AIM: adjust until laser hits ~chest height from your mount.
+ *   - SWEEP_STEP_MS: lower = faster sweep (may miss slow targets).
+ *   - HOLD_MS: how long to hold position after losing detection.
+ *   - PIR sensitivity: turn the small pot on the HC-SR501 to suit range.
+ */
+
+#include <Servo.h>
+
+// ── Pin Definitions ────────────────────────────────────────────────────────
+const int PIR_PIN    = 2;    // HC-SR501 signal output
+const int LASER_PIN  = 3;    // Laser diode module
+const int PAN_PIN    = 9;    // Pan servo (horizontal rotation)
+const int TILT_PIN   = 10;   // Tilt servo (vertical angle)
+
+// ── Pan Servo Limits (degrees) ─────────────────────────────────────────────
+const int PAN_MIN    = 10;   // Left limit
+const int PAN_MAX    = 170;  // Right limit
+const int PAN_HOME   = 90;   // Center start position
+
+// ── Tilt Servo (degrees) ───────────────────────────────────────────────────
+// TILT_AIM: center aim point — tune for your mounting height.
+// The tracker oscillates ±TILT_BAND degrees from this while tracking.
+const int TILT_AIM   = 80;   // Adjust: lower = tilts up, higher = tilts down
+const int TILT_BAND  = 8;    // Vertical scan range while tracking (±degrees)
+
+// ── Timing ─────────────────────────────────────────────────────────────────
+const int  SWEEP_STEP_MS  = 15;    // ms per degree during pan sweep
+const int  TILT_STEP_MS   = 35;    // ms per degree during tilt scan
+const long HOLD_MS        = 2500;  // hold position this long after losing target
+const long WARMUP_MS      = 30000; // PIR stabilisation delay (30s standard)
+
+// ── State Machine ──────────────────────────────────────────────────────────
+enum State { WARMUP, SEARCHING, TRACKING };
+State currentState = WARMUP;
+
+// ── Servo Objects ──────────────────────────────────────────────────────────
+Servo panServo;
+Servo tiltServo;
+
+// ── Runtime Variables ──────────────────────────────────────────────────────
+int  panAngle       = PAN_HOME;
+int  tiltAngle      = TILT_AIM;
+int  panDir         = 1;      // +1 sweeping right, -1 sweeping left
+int  tiltDir        = 1;      // +1 tilting up, -1 tilting down
+
+unsigned long lastSweepStep  = 0;
+unsigned long lastTiltStep   = 0;
+unsigned long lastDetected   = 0;
+unsigned long warmupStart    = 0;
+
+
+// ── Setup ──────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(PIR_PIN,   INPUT);
+  pinMode(LASER_PIN, OUTPUT);
+
+  panServo.attach(PAN_PIN);
+  tiltServo.attach(TILT_PIN);
+
+  // Move to starting position
+  panServo.write(panAngle);
+  tiltServo.write(tiltAngle);
+
+  // Laser off during warmup
+  digitalWrite(LASER_PIN, LOW);
+
+  warmupStart = millis();
+
+  Serial.println("=================================");
+  Serial.println("  Human Tracker - Startup");
+  Serial.println("=================================");
+  Serial.println("Waiting for PIR to stabilise...");
+  Serial.print("Warmup: ");
+  Serial.print(WARMUP_MS / 1000);
+  Serial.println(" seconds");
+}
+
+
+// ── Main Loop ──────────────────────────────────────────────────────────────
+void loop() {
+  unsigned long now    = millis();
+  bool          motion = digitalRead(PIR_PIN);
+
+  switch (currentState) {
+
+    // ── WARMUP ──────────────────────────────────────────────────────────────
+    // PIR sensors need ~30s to calibrate to ambient temperature.
+    // Blink the laser so you know it's alive.
+    case WARMUP:
+      blinkLaser(now, 500);
+      if (now - warmupStart >= WARMUP_MS) {
+        Serial.println("PIR ready. Activating laser and searching...");
+        digitalWrite(LASER_PIN, HIGH);
+        currentState = SEARCHING;
+      }
+      break;
+
+    // ── SEARCHING ───────────────────────────────────────────────────────────
+    // Sweep the pan servo back and forth.
+    // When PIR fires, the laser is pointing at the heat source — lock on.
+    case SEARCHING:
+      sweepPan(now);
+
+      if (motion) {
+        Serial.print("[LOCK] Target acquired at pan=");
+        Serial.print(panAngle);
+        Serial.println("deg");
+
+        // Stop the sweep exactly where the PIR triggered
+        tiltAngle   = TILT_AIM;
+        tiltServo.write(tiltAngle);
+
+        lastDetected = now;
+        currentState = TRACKING;
+      }
+      break;
+
+    // ── TRACKING ────────────────────────────────────────────────────────────
+    // Hold pan position. Oscillate tilt slightly to stay centered on target.
+    // If no detection for HOLD_MS, return to searching.
+    case TRACKING:
+      scanTilt(now);
+
+      if (motion) {
+        lastDetected = now;  // Refresh hold timer while target visible
+      }
+
+      if (now - lastDetected > HOLD_MS) {
+        Serial.println("[LOST] Target gone. Resuming search...");
+        tiltAngle = TILT_AIM;
+        tiltServo.write(tiltAngle);
+        currentState = SEARCHING;
+      }
+      break;
+  }
+}
+
+
+// ── Sweep pan servo left and right continuously ────────────────────────────
+void sweepPan(unsigned long now) {
+  if (now - lastSweepStep < SWEEP_STEP_MS) return;
+  lastSweepStep = now;
+
+  panAngle += panDir;
+
+  if (panAngle >= PAN_MAX) { panAngle = PAN_MAX; panDir = -1; }
+  if (panAngle <= PAN_MIN) { panAngle = PAN_MIN; panDir =  1; }
+
+  panServo.write(panAngle);
+}
+
+
+// ── Oscillate tilt servo to stay on target vertically ─────────────────────
+void scanTilt(unsigned long now) {
+  if (now - lastTiltStep < TILT_STEP_MS) return;
+  lastTiltStep = now;
+
+  tiltAngle += tiltDir;
+
+  if (tiltAngle >= TILT_AIM + TILT_BAND) { tiltDir = -1; }
+  if (tiltAngle <= TILT_AIM - TILT_BAND) { tiltDir =  1; }
+
+  tiltServo.write(tiltAngle);
+}
+
+
+// ── Blink the laser at a given interval (ms) ──────────────────────────────
+void blinkLaser(unsigned long now, int interval) {
+  static unsigned long lastBlink = 0;
+  static bool laserOn = false;
+
+  if (now - lastBlink >= (unsigned long)interval) {
+    lastBlink = now;
+    laserOn = !laserOn;
+    digitalWrite(LASER_PIN, laserOn ? HIGH : LOW);
+  }
+}
